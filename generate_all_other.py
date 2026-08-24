@@ -1,52 +1,51 @@
 """
-Generate model_Other.obj for all phones in dataset/
-Computes the leftover chassis geometry by subtracting Battery, Camera, and Screw
-from model_whole.obj (or combining existing component bounds).
+Generate clean model_Other.obj via memory-efficient k-d tree face filtering.
 """
 
 import os
 import glob
+import numpy as np
 import trimesh
+from scipy.spatial import cKDTree
 
-DATASET_DIR = r"dataset"
-
+DATASET_DIR = "dataset"
 phone_dirs = sorted([d for d in glob.glob(os.path.join(DATASET_DIR, "*")) if os.path.isdir(d)])
-print(f"Found {len(phone_dirs)} phone folders. Generating model_Other.obj...\n")
+
+print(f"Processing {len(phone_dirs)} phone directories...")
 
 for pdir in phone_dirs:
     phone_name = os.path.basename(pdir)
     obj_files = glob.glob(os.path.join(pdir, "*.obj"))
-    
-    # Check if model_Other.obj already exists
-    other_exists = any(os.path.basename(f).lower() in ["model_other.obj", "other.obj"] for f in obj_files)
-    if other_exists and phone_name == "1":
-        print(f"Phone {phone_name}: model_Other.obj already exists, skipping.")
-        continue
 
-    # Load component meshes
+    whole_files = [f for f in obj_files if "whole" in os.path.basename(f).lower()]
     comp_files = [f for f in obj_files if "whole" not in os.path.basename(f).lower() and "other" not in os.path.basename(f).lower()]
-    if not comp_files:
-        print(f"Phone {phone_name}: No component OBJs found, skipping.")
+
+    if not whole_files or not comp_files:
         continue
 
-    meshes = []
-    for cf in comp_files:
-        try:
-            m = trimesh.load(cf, force="mesh")
-            if len(m.faces) > 0:
-                meshes.append(m)
-        except Exception:
-            pass
+    whole_mesh = trimesh.load(whole_files[0], force="mesh")
+    comp_meshes = [trimesh.load(f, force="mesh") for f in comp_files if len(trimesh.load(f, force="mesh").faces) > 0]
 
-    if not meshes:
+    if not comp_meshes:
         continue
 
-    # Combine components and create a outer bounding chassis mesh (convex hull boundary)
-    combined = trimesh.util.concatenate(meshes)
-    chassis = combined.convex_hull
-    
+    combined_comps = trimesh.util.concatenate(comp_meshes)
+
+    # Sample component surface points to build spatial k-d tree
+    comp_pts, _ = trimesh.sample.sample_surface(combined_comps, 20000)
+    tree = cKDTree(comp_pts)
+
+    # Find whole_mesh vertices further than 1.5mm from any labeled component
+    distances, _ = tree.query(whole_mesh.vertices)
+    vertex_mask = distances > 0.0015
+
+    # Map vertex mask to face mask (keep face if all 3 vertices belong to chassis)
+    face_mask = vertex_mask[whole_mesh.faces].all(axis=1)
+
+    # Extract clean chassis submesh
+    chassis_mesh = whole_mesh.submesh([face_mask], append=True)
     out_path = os.path.join(pdir, "model_Other.obj")
-    chassis.export(out_path)
-    print(f"Phone {phone_name}: Exported {out_path}")
+    chassis_mesh.export(out_path)
+    print(f"  Phone {phone_name}: Clean model_Other.obj exported successfully.")
 
-print("\nChassis generation complete across all phone folders!")
+print("\nChassis generation complete across all folders!")
