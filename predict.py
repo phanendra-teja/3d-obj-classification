@@ -1,5 +1,5 @@
 """
-Inference: Predict Components on an Unsegmented Whole Phone Mesh (Outputs Colored 3D Spheres)
+Inference: Predict 4-Class Components on Whole Unsegmented Mesh
 """
 
 import argparse
@@ -16,6 +16,7 @@ CLASS_COLORS = {
     "Battery": [220, 60, 60, 255],   # Red
     "Camera": [60, 200, 90, 255],    # Green
     "Screw": [60, 100, 220, 255],    # Blue
+    "Other": [150, 150, 150, 255],   # Grey (Chassis/Frame)
 }
 
 
@@ -34,7 +35,6 @@ def normalize_features_6d(points, normals):
 
 
 def create_colored_spheres(points, preds, class_names, radius=0.008):
-    """Creates individual colored sphere meshes for each predicted point."""
     spheres = []
     base_sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius)
 
@@ -51,12 +51,10 @@ def create_colored_spheres(points, preds, class_names, radius=0.008):
 
 
 def load_mesh_or_combine(target_path):
-    """Loads a single OBJ mesh file, or combines all OBJs if a directory is passed."""
     if os.path.isdir(target_path):
         obj_files = sorted(glob.glob(os.path.join(target_path, "*.obj")))
         if not obj_files:
             raise FileNotFoundError(f"No .obj files found inside folder `{target_path}`.")
-        print(f"Combining {len(obj_files)} OBJ files from directory `{target_path}` into a whole phone mesh...")
         meshes = [trimesh.load(f, force="mesh") for f in obj_files]
         return trimesh.util.concatenate(meshes)
 
@@ -72,8 +70,6 @@ def predict(model_path, mesh_path, num_points, out_glb, out_npz, device):
     architecture = checkpoint.get("architecture", "pointnet2")
     in_channels = checkpoint.get("in_channels", 6)
 
-    print(f"Loaded checkpoint: architecture={architecture}, features={in_channels}D, classes={class_names}")
-
     if architecture == "pointnet2":
         model = PointNet2Segmentation(num_classes=len(class_names), in_channels=in_channels).to(device)
     else:
@@ -83,8 +79,6 @@ def predict(model_path, mesh_path, num_points, out_glb, out_npz, device):
     model.eval()
 
     mesh = load_mesh_or_combine(mesh_path)
-    print(f"Loaded whole phone mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
-
     points, face_indices = trimesh.sample.sample_surface(mesh, num_points)
     normals = mesh.face_normals[face_indices]
 
@@ -108,30 +102,18 @@ def predict(model_path, mesh_path, num_points, out_glb, out_npz, device):
     for i, name in enumerate(class_names):
         count = int((preds == i).sum())
         print(f"  {name}: {count} points ({100 * count / num_points:.1f}%)")
-    print(f"Mean prediction confidence: {confidences.mean():.3f}")
 
-    print("\nGenerating colored 3D visualization scene...")
     colored_mesh = create_colored_spheres(points, preds, class_names, radius=0.008)
     colored_mesh.export(out_glb)
-
     print(f"Saved visual 3D model to: {out_glb}")
-    print("Color legend: Red=Battery, Green=Camera, Blue=Screw")
-
-    np.savez(
-        out_npz,
-        points=points,
-        predicted_labels=preds,
-        confidences=confidences,
-        class_names=np.array(class_names),
-    )
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="pointnet2_screw_optimized.pt")
-    parser.add_argument("--mesh", required=True, help="Path to whole unsegmented phone CAD mesh or folder")
+    parser.add_argument("--model", default="pointnet2_4class.pt")
+    parser.add_argument("--mesh", required=True)
     parser.add_argument("--num_points", type=int, default=4096)
-    parser.add_argument("--out_glb", default="test_whole_phone.glb")
+    parser.add_argument("--out_glb", default="test_whole_phone_4class.glb")
     parser.add_argument("--out_npz", default="predicted_labels.npz")
     args = parser.parse_args()
 
