@@ -1,32 +1,10 @@
 """
-Inference: Predict Components on a Whole, Unsegmented Mesh
-------------------------------------------------------------------
-This is the actual payoff of training: given a phone mesh with NO vertex
-groups, NO manual Blender labeling -- just a raw obj file -- predict
-which points belong to Battery, Camera, or Screw.
-
-Usage:
-    python predict.py --model pointnet_seg_model.pt --mesh new_phone.obj \
-        --num_points 4096 --out predicted_labels.glb
-
-Output:
-    - Console: predicted point count per class
-    - A .glb file you can open in Blender: the WHOLE mesh's surface,
-      colored by predicted component (one color per class), so you can
-      visually check whether the prediction looks sane.
-    - A .npz with the raw sampled points + predicted labels, in case you
-      want to feed these into the downstream classical pipeline (CoACD /
-      collision checking) instead of manually-exported components.
-
-READ THIS: the model only knows Battery/Camera/Screw (see README
-limitation #2). Every single point gets FORCED into one of these 3
-classes, even points that are actually frame/chassis/unlabeled geometry.
-Don't expect clean boundaries on parts of the mesh outside what the
-model was trained to recognize -- this is exactly why the colored glb
-output matters: LOOK at it before trusting the predictions blindly.
+Inference: Predict Components on an Unsegmented Whole Phone Mesh (Outputs Colored 3D Spheres)
 """
 
 import argparse
+import glob
+import os
 import numpy as np
 import torch
 import trimesh
@@ -35,65 +13,109 @@ from model import PointNetSegmentation
 from model_pointnet2 import PointNet2Segmentation
 
 CLASS_COLORS = {
-    "Battery": [220, 60, 60, 255],
-    "Camera": [60, 200, 90, 255],
-    "Screw": [60, 100, 220, 255],
+    "Battery": [220, 60, 60, 255],   # Red
+    "Camera": [60, 200, 90, 255],    # Green
+    "Screw": [60, 100, 220, 255],    # Blue
 }
 
 
-def normalize_point_cloud(points):
-    """Must match the normalization used in prepare_dataset.py exactly."""
+def normalize_features_6d(points, normals):
     centroid = points.mean(axis=0)
     points = points - centroid
     max_dist = np.max(np.linalg.norm(points, axis=1))
     if max_dist > 0:
         points = points / max_dist
-    return points, centroid, max_dist
+
+    norm_mags = np.linalg.norm(normals, axis=1, keepdims=True)
+    norm_mags[norm_mags == 0] = 1.0
+    normals = normals / norm_mags
+
+    return np.hstack([points, normals]).astype(np.float32)
+
+
+def create_colored_spheres(points, preds, class_names, radius=0.008):
+    """Creates individual colored sphere meshes for each predicted point."""
+    spheres = []
+    base_sphere = trimesh.creation.icosphere(subdivisions=1, radius=radius)
+
+    for pt, pred in zip(points, preds):
+        c_name = class_names[pred]
+        color = CLASS_COLORS.get(c_name, [128, 128, 128, 255])
+
+        s = base_sphere.copy()
+        s.apply_translation(pt)
+        s.visual.face_colors = color
+        spheres.append(s)
+
+    return trimesh.util.concatenate(spheres)
+
+
+def load_mesh_or_combine(target_path):
+    """Loads a single OBJ mesh file, or combines all OBJs if a directory is passed."""
+    if os.path.isdir(target_path):
+        obj_files = sorted(glob.glob(os.path.join(target_path, "*.obj")))
+        if not obj_files:
+            raise FileNotFoundError(f"No .obj files found inside folder `{target_path}`.")
+        print(f"Combining {len(obj_files)} OBJ files from directory `{target_path}` into a whole phone mesh...")
+        meshes = [trimesh.load(f, force="mesh") for f in obj_files]
+        return trimesh.util.concatenate(meshes)
+
+    if os.path.isfile(target_path):
+        return trimesh.load(target_path, force="mesh")
+
+    raise FileNotFoundError(f"Could not find valid file or folder at `{target_path}`.")
 
 
 def predict(model_path, mesh_path, num_points, out_glb, out_npz, device):
     checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    class_names = list(checkpoint["class_names"])
-    architecture = checkpoint.get("architecture", "pointnet")  # older checkpoints predate this field
-    print(f"Loaded model trained on classes: {class_names} (architecture: {architecture})")
+    class_names = [str(c) for c in checkpoint["class_names"]]
+    architecture = checkpoint.get("architecture", "pointnet2")
+    in_channels = checkpoint.get("in_channels", 6)
 
-    model = (PointNet2Segmentation(num_classes=len(class_names)) if architecture == "pointnet2"
-              else PointNetSegmentation(num_classes=len(class_names))).to(device)
+    print(f"Loaded checkpoint: architecture={architecture}, features={in_channels}D, classes={class_names}")
+
+    if architecture == "pointnet2":
+        model = PointNet2Segmentation(num_classes=len(class_names), in_channels=in_channels).to(device)
+    else:
+        model = PointNetSegmentation(num_classes=len(class_names)).to(device)
+
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    mesh = trimesh.load(mesh_path, force="mesh")
-    print(f"Loaded {mesh_path}: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
+    mesh = load_mesh_or_combine(mesh_path)
+    print(f"Loaded whole phone mesh: {len(mesh.vertices)} verts, {len(mesh.faces)} faces")
 
     points, face_indices = trimesh.sample.sample_surface(mesh, num_points)
-    points = points.astype(np.float32)
-    print(f"Sampled {num_points} points from the surface")
+    normals = mesh.face_normals[face_indices]
 
-    norm_points, centroid, scale = normalize_point_cloud(points)
+    if in_channels == 6:
+        features = normalize_features_6d(points, normals)
+    else:
+        centroid = points.mean(axis=0)
+        points_norm = points - centroid
+        max_dist = np.max(np.linalg.norm(points_norm, axis=1))
+        features = (points_norm / max_dist if max_dist > 0 else points_norm).astype(np.float32)
 
     with torch.no_grad():
-        input_tensor = torch.from_numpy(norm_points).float().unsqueeze(0).to(device)  # (1, N, 3)
-        logits = model(input_tensor)  # (1, N, num_classes)
+        input_tensor = torch.from_numpy(features).float().unsqueeze(0).to(device)
+        logits = model(input_tensor)
         probs = torch.softmax(logits, dim=-1)
         confidences, preds = probs.max(dim=-1)
         preds = preds.squeeze(0).cpu().numpy()
         confidences = confidences.squeeze(0).cpu().numpy()
 
-    print("\nPredicted point counts per class:")
+    print("\nPredicted point distribution across whole phone:")
     for i, name in enumerate(class_names):
         count = int((preds == i).sum())
         print(f"  {name}: {count} points ({100 * count / num_points:.1f}%)")
-    print(f"\nMean prediction confidence: {confidences.mean():.3f} "
-          f"(low confidence suggests the model is unsure -- often means "
-          f"the true region isn't one of its {len(class_names)} known classes)")
+    print(f"Mean prediction confidence: {confidences.mean():.3f}")
 
-    # Colored point cloud for visual inspection
-    colors = np.array([CLASS_COLORS.get(class_names[p], [128, 128, 128, 255]) for p in preds])
-    point_cloud = trimesh.points.PointCloud(points, colors=colors)
-    scene = trimesh.Scene([point_cloud])
-    scene.export(out_glb)
-    print(f"\nSaved colored prediction to {out_glb} -- open in Blender to visually check the result.")
-    print("Color legend: " + ", ".join(f"{name}={CLASS_COLORS[name][:3]}" for name in class_names))
+    print("\nGenerating colored 3D visualization scene...")
+    colored_mesh = create_colored_spheres(points, preds, class_names, radius=0.008)
+    colored_mesh.export(out_glb)
+
+    print(f"Saved visual 3D model to: {out_glb}")
+    print("Color legend: Red=Battery, Green=Camera, Blue=Screw")
 
     np.savez(
         out_npz,
@@ -102,15 +124,14 @@ def predict(model_path, mesh_path, num_points, out_glb, out_npz, device):
         confidences=confidences,
         class_names=np.array(class_names),
     )
-    print(f"Saved raw predictions to {out_npz}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to trained .pt checkpoint")
-    parser.add_argument("--mesh", required=True, help="Path to a whole, unsegmented phone obj file")
+    parser.add_argument("--model", default="pointnet2_screw_optimized.pt")
+    parser.add_argument("--mesh", required=True, help="Path to whole unsegmented phone CAD mesh or folder")
     parser.add_argument("--num_points", type=int, default=4096)
-    parser.add_argument("--out_glb", default="predicted_labels.glb")
+    parser.add_argument("--out_glb", default="test_whole_phone.glb")
     parser.add_argument("--out_npz", default="predicted_labels.npz")
     args = parser.parse_args()
 

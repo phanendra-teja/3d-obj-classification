@@ -1,0 +1,27 @@
+# 1. Ignore everything by default
+*
+
+# 2. Allow tracking of directories so Git can traverse folders
+!*/
+
+# 3. Explicitly allow Python source files and key documentation
+!*.py
+!*.md
+!.gitignore
+
+# 4. Explicitly ignore compiled/cached python files and virtual environments
+__pycache__/
+*.pyc
+gpu/
+env/
+venv/
+.venv/
+
+# 5. Double-check heavy project files are ignored
+*.obj
+*.glb
+*.gltf
+*.npz
+*.pt
+*.pth
+dataset/
