@@ -1,8 +1,5 @@
 """
-Dataset Preparation for 4-Class Component & Chassis Segmentation
-----------------------------------------------------------------
-Ignores whole-mesh files (model_whole.obj) and extracts features
-from individual component OBJ files.
+Dataset Preparation: Proportional Scene Sampling for 4-Class Phone Segmentation
 """
 
 import argparse
@@ -15,7 +12,6 @@ import trimesh
 CLASS_NAMES = ["Battery", "Camera", "Screw", "Other"]
 CLASS_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
 CLASS_TO_IDX_LOWER = {name.lower(): idx for name, idx in CLASS_TO_IDX.items()}
-
 OTHER_ALIASES = {"other", "chassis", "frame", "body", "whole_chassis"}
 
 
@@ -23,129 +19,111 @@ def component_name_from_filename(path):
     base = os.path.splitext(os.path.basename(path))[0]
     match = re.match(r"^.*?_([A-Za-z0-9]+)$", base)
     comp = match.group(1) if match else base
-    
     if comp.lower() in OTHER_ALIASES:
         return "Other"
     return comp
 
 
-def load_phone_point_cloud_with_normals(phone_dir, points_per_component):
+def load_whole_phone_scene(phone_dir, total_points=8192):
     obj_paths = sorted(glob.glob(os.path.join(phone_dir, "*.obj")))
-    all_points, all_normals, all_labels = [], [], []
+    valid_paths = [p for p in obj_paths if "whole" not in os.path.basename(p).lower()]
 
-    for path in obj_paths:
-        filename = os.path.basename(path).lower()
-        
-        # Skip whole mesh file so it doesn't pollute class labels
-        if "whole" in filename:
-            continue
+    component_meshes = []
+    component_labels = []
 
+    for path in valid_paths:
         comp_name = component_name_from_filename(path)
         comp_key = comp_name.lower()
         if comp_key not in CLASS_TO_IDX_LOWER:
             continue
-        class_idx = CLASS_TO_IDX_LOWER[comp_key]
 
+        c_idx = CLASS_TO_IDX_LOWER[comp_key]
         mesh = trimesh.load(path, force="mesh")
         if len(mesh.faces) == 0:
             continue
 
-        points, face_indices = trimesh.sample.sample_surface(mesh, points_per_component)
-        normals = mesh.face_normals[face_indices]
-        labels = np.full(points.shape[0], class_idx, dtype=np.int64)
+        component_meshes.append(mesh)
+        component_labels.append(c_idx)
 
-        all_points.append(points)
-        all_normals.append(normals)
-        all_labels.append(labels)
-
-    if not all_points:
+    if not component_meshes:
         return None, None
 
-    points_arr = np.concatenate(all_points, axis=0).astype(np.float32)
-    normals_arr = np.concatenate(all_normals, axis=0).astype(np.float32)
-    labels_arr = np.concatenate(all_labels, axis=0)
+    # Calculate area proportional sampling rates
+    areas = np.array([m.area for m in component_meshes])
+    total_area = areas.sum()
+    if total_area == 0:
+        return None, None
 
-    features_arr = np.hstack([points_arr, normals_arr])
-    return features_arr, labels_arr
+    sampled_pts_list, sampled_norms_list, sampled_lbls_list = [], [], []
 
+    for mesh, c_idx, area in zip(component_meshes, component_labels, areas):
+        # Guarantee minimum samples for tiny components like screws/cameras
+        n_pts = max(128, int(round((area / total_area) * total_points)))
+        pts, face_idx = trimesh.sample.sample_surface(mesh, n_pts)
+        norms = mesh.face_normals[face_idx]
+        lbls = np.full(n_pts, c_idx, dtype=np.int64)
 
-def normalize_point_cloud_6d(features):
-    points = features[:, :3]
-    normals = features[:, 3:]
+        sampled_pts_list.append(pts)
+        sampled_norms_list.append(norms)
+        sampled_lbls_list.append(lbls)
 
-    centroid = points.mean(axis=0)
-    points = points - centroid
-    max_dist = np.max(np.linalg.norm(points, axis=1))
-    if max_dist > 0:
-        points = points / max_dist
+    pts_arr = np.concatenate(sampled_pts_list, axis=0)
+    norms_arr = np.concatenate(sampled_norms_list, axis=0)
+    lbls_arr = np.concatenate(sampled_lbls_list, axis=0)
 
-    norm_mags = np.linalg.norm(normals, axis=1, keepdims=True)
+    # Resample or truncate to exact total_points
+    if len(pts_arr) > total_points:
+        idx = np.random.choice(len(pts_arr), total_points, replace=False)
+    else:
+        idx = np.random.choice(len(pts_arr), total_points, replace=True)
+
+    pts_arr = pts_arr[idx]
+    norms_arr = norms_arr[idx]
+    lbls_arr = lbls_arr[idx]
+
+    # Normalize 6D spatial coordinates
+    centroid = pts_arr.mean(axis=0)
+    pts_norm = pts_arr - centroid
+    max_d = np.max(np.linalg.norm(pts_norm, axis=1))
+    if max_d > 0:
+        pts_norm = pts_norm / max_d
+
+    norm_mags = np.linalg.norm(norms_arr, axis=1, keepdims=True)
     norm_mags[norm_mags == 0] = 1.0
-    normals = normals / norm_mags
+    norms_norm = norms_arr / norm_mags
 
-    return np.hstack([points, normals]).astype(np.float32)
-
-
-def build_dataset(dataset_dir, points_per_component):
-    phone_dirs = sorted([d for d in glob.glob(os.path.join(dataset_dir, "*")) if os.path.isdir(d)])
-    if not phone_dirs:
-        raise FileNotFoundError(f"No phone subfolders found in {dataset_dir}.")
-
-    all_phone_features, all_phone_labels, phone_names, incomplete_phones = [], [], [], []
-
-    for phone_dir in phone_dirs:
-        name = os.path.basename(phone_dir)
-        features, labels = load_phone_point_cloud_with_normals(phone_dir, points_per_component)
-        if features is None:
-            incomplete_phones.append((name, "no valid OBJ components found"))
-            continue
-
-        features = normalize_point_cloud_6d(features)
-        class_counts = {CLASS_NAMES[i]: int((labels == i).sum()) for i in range(len(CLASS_NAMES))}
-
-        missing = [c for c, count in class_counts.items() if count == 0]
-        print(f"Phone '{name}': counts = {class_counts}")
-        if missing:
-            incomplete_phones.append((name, f"missing: {', '.join(missing)}"))
-
-        all_phone_features.append(features)
-        all_phone_labels.append(labels)
-        phone_names.append(name)
-
-    return all_phone_features, all_phone_labels, phone_names, incomplete_phones
+    features = np.hstack([pts_norm, norms_norm]).astype(np.float32)
+    return features, lbls_arr
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset_dir", required=True)
-    parser.add_argument("--output", default="points_dataset_4class.npz")
-    parser.add_argument("--points_per_component", type=int, default=1024)
-    parser.add_argument("--exclude_incomplete", action="store_true")
+    parser.add_argument("--dataset_dir", default="dataset")
+    parser.add_argument("--output", default="points_dataset_proportional.npz")
+    parser.add_argument("--total_points", type=int, default=8192)
     args = parser.parse_args()
 
-    all_features, all_labels, phone_names, incomplete_phones = build_dataset(args.dataset_dir, args.points_per_component)
+    phone_dirs = sorted([d for d in glob.glob(os.path.join(args.dataset_dir, "*")) if os.path.isdir(d)])
+    all_feats, all_lbls, names = [], [], []
 
-    if incomplete_phones:
-        print("\n" + "=" * 60)
-        print(f"Incomplete phones ({len(incomplete_phones)} total):")
-        for name, reason in incomplete_phones:
-            print(f"  Phone {name}: {reason}")
-        print("=" * 60)
+    for pdir in phone_dirs:
+        pname = os.path.basename(pdir)
+        feats, lbls = load_whole_phone_scene(pdir, total_points=args.total_points)
+        if feats is None:
+            continue
 
-    if args.exclude_incomplete and incomplete_phones:
-        incomplete_names = {name for name, _ in incomplete_phones}
-        keep_indices = [i for i, name in enumerate(phone_names) if name not in incomplete_names]
-        dropped = len(phone_names) - len(keep_indices)
-        all_features = [all_features[i] for i in keep_indices]
-        all_labels = [all_labels[i] for i in keep_indices]
-        phone_names = [phone_names[i] for i in keep_indices]
-        print(f"\n--exclude_incomplete: dropped {dropped} phone(s), {len(phone_names)} valid phone(s) remain.")
+        counts = {CLASS_NAMES[i]: int((lbls == i).sum()) for i in range(len(CLASS_NAMES))}
+        print(f"Phone '{pname}': {counts}")
+
+        all_feats.append(feats)
+        all_lbls.append(lbls)
+        names.append(pname)
 
     np.savez(
         args.output,
-        points=np.array(all_features, dtype=object),
-        labels=np.array(all_labels, dtype=object),
-        phone_names=np.array(phone_names),
+        points=np.array(all_feats, dtype=object),
+        labels=np.array(all_lbls, dtype=object),
+        phone_names=np.array(names),
         class_names=np.array(CLASS_NAMES),
     )
-    print(f"\nSaved 4-class dataset ({len(phone_names)} phones) to {args.output}")
+    print(f"\nSaved proportional scene dataset ({len(names)} phones) to `{args.output}`")
